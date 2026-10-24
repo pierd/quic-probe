@@ -9,32 +9,21 @@ use thiserror::Error;
 #[cfg(feature = "tls-native-roots")]
 fn add_native_roots(roots: &mut rustls::RootCertStore) {
     tracing::debug!("Loading native root certificates");
-    match rustls_native_certs::load_native_certs() {
-        Ok(certs) => {
-            for cert in certs {
-                let cert = rustls::Certificate(cert.0);
-                if let Err(e) = roots.add(&cert) {
-                    tracing::warn!(?cert, "Failed to parse trust anchor: {}", e);
-                }
-            }
+    let result = rustls_native_certs::load_native_certs();
+    for cert in result.certs {
+        if let Err(e) = roots.add(cert) {
+            tracing::warn!("Failed to parse trust anchor: {}", e);
         }
-
-        Err(e) => {
-            tracing::warn!("Failed load any default trust roots: {}", e);
-        }
-    };
+    }
+    for e in result.errors {
+        tracing::warn!("Failed load any default trust roots: {}", e);
+    }
 }
 
 #[cfg(feature = "tls-webpki-roots")]
 fn add_webpki_roots(roots: &mut rustls::RootCertStore) {
     tracing::debug!("Loading webpki root certificates");
-    roots.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 }
 
 fn load_root_certs() -> rustls::RootCertStore {
@@ -82,7 +71,9 @@ impl ProbeBuilder {
 
     pub fn build(self) -> Result<Probe, std::io::Error> {
         let mut endpoint = quinn::Endpoint::client(self.bind_addr)?;
-        let mut client_config = quinn::ClientConfig::new(Arc::new(self.tls_config));
+        let tls_config = quinn::crypto::rustls::QuicClientConfig::try_from(self.tls_config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(tls_config));
         client_config.transport_config(Arc::new(self.transport_config));
         endpoint.set_default_client_config(client_config);
         Ok(Probe { endpoint })
@@ -92,13 +83,10 @@ impl ProbeBuilder {
 impl Default for ProbeBuilder {
     fn default() -> Self {
         let roots = load_root_certs();
-        let tls_config = rustls::ClientConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let tls_config =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots)
+                .with_no_client_auth();
 
         Self {
             tls_config,
@@ -126,7 +114,7 @@ pub enum ProbeError {
 impl From<quinn::ConnectError> for ProbeError {
     fn from(e: quinn::ConnectError) -> Self {
         match e {
-            quinn::ConnectError::InvalidDnsName(name) => ProbeError::InvalidDnsName(name),
+            quinn::ConnectError::InvalidServerName(name) => ProbeError::InvalidDnsName(name),
             quinn::ConnectError::InvalidRemoteAddress(addr) => {
                 ProbeError::InvalidRemoteAddress(addr)
             }
